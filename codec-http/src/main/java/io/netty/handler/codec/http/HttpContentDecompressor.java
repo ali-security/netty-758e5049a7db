@@ -102,19 +102,24 @@ public class HttpContentDecompressor extends HttpContentDecoder {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
                     ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper, maxAllocation));
         }
+        // Brotli/Snappy/Zstd decoders do not enforce the configured maxAllocation natively, so a
+        // decompression bomb can bypass the limit (CVE-2026-42587). Append a guard that caps the
+        // cumulative decompressed output, mirroring the reject-on-overflow behavior of the zlib path.
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+              ctx.channel().config(), new BrotliDecoder(), new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+                    ctx.channel().config(), new SnappyFrameDecoder(),
+                    new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         if (Zstd.isAvailable() && ZSTD.contentEqualsIgnoreCase(contentEncoding)) {
             return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new ZstdDecoder());
+                    ctx.channel().config(), new ZstdDecoder(),
+                    new HttpDecompressionAllocationGuard(maxAllocation));
         }
 
         // 'identity' or unsupported

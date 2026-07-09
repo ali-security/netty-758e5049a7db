@@ -20,6 +20,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
@@ -404,6 +405,31 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
+    public void testNonCrlfControlBytesPrecedingRequestLineAreRejected() {
+        // RFC 9112 §2.2: servers SHOULD ignore "at least one empty line (CRLF)" before the
+        // request-line.  Non-CRLF control bytes are not part of this robustness allowance
+        // and must not be silently swallowed.
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+
+        ByteBuf buf = Unpooled.buffer();
+        buf.writeByte(0x00);   // NUL  — not an empty CRLF line
+        buf.writeByte(0x01);   // SOH  — not an empty CRLF line
+        buf.writeCharSequence(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                CharsetUtil.US_ASCII);
+
+        channel.writeInbound(buf);
+        HttpRequest req = channel.readInbound();
+
+        DecoderResult decoderResult = req.decoderResult();
+        assertTrue(decoderResult.isFailure(),
+                "Non-CRLF control bytes before the request-line must not be silently skipped");
+        assertThat(decoderResult.cause()).isInstanceOf(InvalidLineSeparatorException.class);
+
+        assertFalse(channel.finish());
+    }
+
+    @Test
     public void testTooLargeHeaders() {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(1024, 10, 1024));
         String requestStr = "GET /some/path HTTP/1.1\r\n" +
@@ -592,6 +618,16 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
+    public void testChunkedNotLastInTransferEncoding() {
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                "Transfer-Encoding: chunked, identity\r\n" +
+                "Content-Length: 1\r\n" +
+                "Host: netty.io\r\n\r\n" +
+                "a";
+        testInvalidHeaders0(requestStr);
+    }
+
+    @Test
     public void testContentLengthAndTransferEncodingHeadersWithVerticalTab() {
         testContentLengthAndTransferEncodingHeadersWithInvalidSeparator((char) 0x0b, false);
         testContentLengthAndTransferEncodingHeadersWithInvalidSeparator((char) 0x0b, true);
@@ -616,7 +652,7 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
-    public void testContentLengthHeaderAndChunked() {
+    public void testContentLengthHeaderAndChunkedHttp11() {
         String requestStr = "POST / HTTP/1.1\r\n" +
                 "Host: example.com\r\n" +
                 "Connection: close\r\n" +
@@ -626,12 +662,45 @@ public class HttpRequestDecoderTest {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
         assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
         HttpRequest request = channel.readInbound();
+        assertTrue(request.decoderResult().isFailure());
+        assertThat(request.decoderResult().cause()).isInstanceOf(DecoderException.class);
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testContentLengthHeaderAndChunkedHttp11RFC7230() {
+        String requestStr = "POST / HTTP/1.1\r\n" +
+                "Host: example.com\r\n" +
+                "Content-Length: 5\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(
+                new HttpDecoderConfig().setUseRfc9112TransferEncoding(false)));
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
         assertFalse(request.decoderResult().isFailure());
         assertTrue(request.headers().names().contains("Transfer-Encoding"));
         assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
         assertFalse(request.headers().contains("Content-Length"));
+        assertEquals("close", request.headers().get("Connection"));
         LastHttpContent c = channel.readInbound();
         c.release();
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testContentLengthHeaderAndChunkedHttp10() {
+        String requestStr = "POST / HTTP/1.0\r\n" +
+                "Host: example.com\r\n" +
+                "Connection: close\r\n" +
+                "Content-Length: 5\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertTrue(request.decoderResult().isFailure());
+        assertThat(request.decoderResult().cause()).isInstanceOf(DecoderException.class);
         assertFalse(channel.finish());
     }
 
@@ -691,6 +760,236 @@ public class HttpRequestDecoderTest {
         DecoderResult decoderResult = content.decoderResult();
         assertTrue(decoderResult.isFailure()); // But then parsing the chunk delimiter must fail.
         assertThat(decoderResult.cause()).isInstanceOf(InvalidChunkTerminationException.class);
+        content.release();
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustParsedChunkExtensionsWithQuotedStrings() throws Exception {
+        // See full explanation: https://w4ke.info/2025/10/29/funky-chunks-2.html
+        String requestStr = "GET /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;a=\" ;\t\"\r\n" + // chunk extension quote end
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertFalse(decoderResult.isFailure()); // And we parse the chunk.
+        content.release();
+        LastHttpContent last = channel.readInbound();
+        assertEquals(0, last.content().readableBytes());
+        last.release();
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void mustRejectChunkExtensionsWithLineBreaksInQuotedStrings() throws Exception {
+        // See full explanation: https://w4ke.info/2025/10/29/funky-chunks-2.html
+        String requestStr = "GET /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;a=\"\r\n" + // chunk extension quote start
+                "X\r\n" +
+                "0\r\n\r\n" +
+                "GET /two HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "\"\r\n" + // chunk extension quote end
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // Chunk extension is not allowed to contain line breaks.
+        assertThat(decoderResult.cause()).isInstanceOf(InvalidChunkExtensionException.class);
+        content.release();
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void mustParseChunkExtensionsWithQuotedStringsAndEscapes() throws Exception {
+        // See full explanation: https://w4ke.info/2025/10/29/funky-chunks-2.html
+        String requestStr = "GET /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;a=\" \\\";\t\"\r\n" +
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertFalse(decoderResult.isFailure()); // And we parse the chunk.
+        content.release();
+        LastHttpContent last = channel.readInbound();
+        assertEquals(0, last.content().readableBytes());
+        last.release();
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void mustRejectChunkExtensionsWithEscapedLineBreakInQuotedStrings() throws Exception {
+        // See full explanation: https://w4ke.info/2025/10/29/funky-chunks-2.html
+        String requestStr = "GET /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;a=\" \\\n;\t\"\r\n" +
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // Chunk extension is not allowed to contain line breaks.
+        assertThat(decoderResult.cause()).isInstanceOf(InvalidChunkExtensionException.class);
+        content.release();
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void mustRejectChunkExtensionsWithEscapedCarriageReturnInQuotedStrings() throws Exception {
+        // See full explanation: https://w4ke.info/2025/10/29/funky-chunks-2.html
+        String requestStr = "GET /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;a=\" \\\r;\t\"\r\n" +
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // Chunk extension is not allowed to contain carraige return.
+        assertThat(decoderResult.cause()).isInstanceOf(InvalidChunkExtensionException.class);
+        content.release();
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void lineLengthRestrictionMustNotApplyToChunkContents() throws Exception {
+        char[] chars = new char[10000];
+        Arrays.fill(chars, 'a');
+        String requestContent = new String(chars);
+        String requestStr = "POST /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                Integer.toHexString(chars.length) + "\r\n" +
+                requestContent + "\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(request.headers().names().contains("Transfer-Encoding"));
+        assertTrue(request.headers().contains("Transfer-Encoding", "chunked", false));
+        int contentLength = 0;
+        HttpContent content;
+        do {
+            content = channel.readInbound();
+            DecoderResult decoderResult = content.decoderResult();
+            if (decoderResult.cause() != null) {
+                throw new Exception(decoderResult.cause());
+            }
+            assertFalse(decoderResult.isFailure()); // And we parse the chunk.
+            contentLength += content.content().readableBytes();
+            content.release();
+        } while (!(content instanceof LastHttpContent));
+        assertEquals(chars.length, contentLength);
+        assertFalse(channel.finish()); // And there are no other chunks parsed.
+    }
+
+    @Test
+    void mustRejectChunkSizeWithNonHexadecimalCharacters() throws Exception {
+        String requestStr = "POST /one HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "test\r\n\r\n" + // chunk extension quote start
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure()); // We parse the headers
+        HttpContent content = channel.readInbound();
+        assertTrue(content.decoderResult().isFailure());
+        assertThat(content.decoderResult().cause()).isInstanceOf(NumberFormatException.class);
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustParseMultipleChunkExtensionsWithTokenValues() throws Exception {
+        String requestStr = "GET / HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "1;name1=val1;name2=val2\r\n" +
+                "Y\r\n" +
+                "0\r\n" +
+                "\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpRequest request = channel.readInbound();
+        assertFalse(request.decoderResult().isFailure());
+        HttpContent content = channel.readInbound();
+        assertFalse(content.decoderResult().isFailure());
+        content.release();
+        LastHttpContent last = channel.readInbound();
+        assertEquals(0, last.content().readableBytes());
+        last.release();
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void mustRejectChunkSizeThatWouldCauseOverflow() {
+        String requestStr = "POST / HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "100000004\r\n" +
+                "test\r\n" +
+                "0\r\n" +
+                "\r\n" +
+                "GET /smuggled HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Content-Length: 0\r\n" +
+                "\r\n";
+
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+
+        // Request 1
+        HttpRequest request = channel.readInbound();
+        assertTrue(request.decoderResult().isSuccess());
+        HttpContent content = channel.readInbound();
+        assertFalse(content.decoderResult().isSuccess());
+        assertThat(content.decoderResult().cause()).hasMessageContaining("Chunk size overflow");
         content.release();
         assertFalse(channel.finish());
     }
