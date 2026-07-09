@@ -16,7 +16,7 @@
 name: PR Reports
 on:
   workflow_run:
-    workflows: [ "Build PR" ]
+    workflows: [Build PR]
     types:
       - completed
 env:
