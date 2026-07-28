@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Breaking-Question Calibration Datasets</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }
+    code { font-family: ui-monospace, monospace; background: #f0f0f0; padding: .1em .3em; border-radius: 3px; }
+    pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+    pre code { background: none; padding: 0; }
+    hr { border: none; border-top: 1px solid #ccc; margin: 2rem 0; }
+    h2 { margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <p>The purpose of these tests is to calibrate the breaking questions
+  the goal is to allow an agent to automatically modify the questions as needed</p>
+
+  <h3>.json files</h3>
+  <p>there is a .json with expected result for each question<br>
+  format &lt;name of question enum&gt;.json<br>
+  each .json should include <code>true</code> examples<br>
+  the false is running against all questions</p>
+
+  <h3>expected results</h3>
+  <p>100% success over 3-5 iterations<br>
+  this is a very small sample case</p>
+
+  <h3>tool to know</h3>
+  <ul>
+    <li>DSPy &mdash; Machine learning / Compilation</li>
+    <li>Promptimize / Promptim &mdash; Test-Driven Development (TDD)</li>
+    <li>instructor &mdash; structured Output Enforcers</li>
+  </ul>
+
+  <hr>
+
+  <h2>Why per-question (not just the verdict)</h2>
+  <p><code>suite run</code> scores only the aggregate <code>breaking</code> verdict and throws
+  <code>info.answers</code> away, so it can't tell you <em>which</em> question was miscalibrated.
+  Keeping the per-question answer and comparing it to a gold label separates the
+  two root causes of a wrong verdict (the Bucket-A / Bucket-B split in
+  <a href="../../../sdk_agents/breaking/DEBUG.md"><code>../../sdk_agents/breaking/DEBUG.md</code></a>):</p>
+  <ul>
+    <li><strong>Bucket A</strong> &mdash; the agent answered a question <em>wrong</em> &rarr; reword it / feed the
+    sub-agent better evidence.</li>
+    <li><strong>Bucket B</strong> &mdash; every answer is right but the <em>verdict</em> is wrong &rarr; re-tier the
+    question or re-sweep the threshold.</li>
+  </ul>
+
+  <h2>File format</h2>
+  <p>One file per question, named after its <code>BreakingQuestion</code> member
+  (<a href="../../../models/breaking_questions.py"><code>models/breaking_questions.py</code></a>):</p>
+  <pre><code>// API_SIGNATURE_CHANGE.json
+[
+  // shorthand — a bare bool/null labels the file's own question
+  {"path": "&lt;repo-relative patch&gt;", "expected": true},   // should fire
+  {"path": "&lt;repo-relative patch&gt;", "expected": false},  // hard negative
+  {"path": "&lt;repo-relative patch&gt;", "expected": null},   // honestly can't-determine
+
+  // map — label any answers you know for this patch; one run scores them all.
+  // The file's own question (API_SIGNATURE_CHANGE) MUST be present.
+  {"path": "&lt;repo-relative patch&gt;",
+   "expected": {"API_SIGNATURE_CHANGE": true,
+                "REMOVES_FUNCTIONALITY": true,
+                "SAME_CLASS_PUBLIC_PRECEDENT": false}}
+]</code></pre>
+  <p>The file's question is its <strong>filename</strong> (validated on load). <code>expected</code> is the
+  correct answer(s) &mdash; not the breaking verdict. Because one agent run answers
+  every question, <code>expected</code> may be a <strong>map</strong> of every answer you know for that
+  patch; every labeled cell is scored, so a single run feeds many questions'
+  stats. A hard negative is a near-miss where the question plausibly <em>could</em> fire
+  but shouldn't (e.g. <code>lodash __proto__</code> must NOT fire a "blocks a legitimate
+  member" question, while <code>struts class</code>-block should). A lone positive tests
+  only recall.</p>
+
+  <h3>Scoring: fire vs not-fire</h3>
+  <p>The verdict (<code>analyse_answers</code>) acts <strong>only</strong> on <code>true</code> &mdash; a question that fires.
+  <code>false</code> and <code>null</code> (can't-determine) both mean "did not fire" and are
+  verdict-equivalent, so scoring collapses to fire vs not-fire:</p>
+  <ul>
+    <li>gold <code>true</code> &rarr; the agent must answer <code>true</code>;</li>
+    <li>gold <code>false</code> <strong>or</strong> <code>null</code> &rarr; the agent may answer <strong>either</strong> <code>false</code> or
+    <code>null</code>.</li>
+  </ul>
+  <p>So a hard negative labeled <code>false</code> still passes when the agent honestly answers
+  <code>null</code>. This matters because the upstream-evidence questions (e.g.
+  <code>UPSTREAM_CALLS_BREAKING</code>) return can't-determine when no source <em>positively</em>
+  flags a break &mdash; <code>null</code> there is correct and never changes the verdict, so it
+  must not be scored as a miss against a <code>false</code> label.</p>
+
+  <h2>Run</h2>
+  <pre><code># default: scans this directory for &lt;QUESTION_NAME&gt;.json files
+agentic breaking calibration --manager maven -n 3 -j 8
+
+# or point at another directory of question files
+agentic breaking calibration path/to/datasets -n 5 -j 8 --only-fails</code></pre>
+  <p><code>-n/--iterations</code> (default 3) re-runs each example; it <strong>passes only if every
+  iteration is correct</strong>, so an unstable question fails even when its majority
+  answer is right &mdash; this is the "100% over 3-5 iterations" bar above. The summary
+  adds a per-question table split into positive (should-fire) and negative
+  examples, so recall and precision are visible separately.</p>
+
+  <h2>Results file (<code>calibration_results.yaml</code>)</h2>
+  <p>Each run writes a YAML results file (default <code>&lt;dataset dir&gt;/calibration_results.yaml</code>,
+  override with <code>--results</code>). It's <strong>created or merge-updated</strong> &mdash; counts
+  <strong>accumulate across runs</strong> (this run's <code>attempts</code>/<code>failures</code> are added onto the
+  stored totals), and your <code>note:</code> fields and comments are kept:</p>
+  <pre><code>UPSTREAM_CALLS_BREAKING_b9cf2cba7a3b0310b54f290eec86fadd:   # &lt;NAME&gt;_&lt;md5(used_prompt)&gt;
+  used_prompt: Do the upstream commit/PR/release notes explicitly call this change breaking?
+  paths:
+    NPM/node-forge/.../CVE-2022-0122.patch:
+      expected: yes            # gold for this question on this path
+      attempts: 6              # total iterations run so far (sum of --iterations across runs)
+      failures: 2              # iterations where this cell missed (finer than PASS/FAIL)
+      note: |                  # yours — edit freely; preserved across re-runs
+        Changelog HAS a Breaking-Changes section; WebFetch summarized against the
+        CVE id and dropped it — retrieval/summarization loss, not a wording bug.</code></pre>
+  <p>Delete a row (or the whole file) to reset its accumulated counts.</p>
+  <ul>
+    <li><strong>Keyed by <code>md5(used_prompt)</code>.</strong> Rewording a question changes its md5, so the
+    run writes under a <em>new</em> key and the old rows are <strong>orphaned</strong> &mdash; a mechanical
+    enforcement of DEBUG.md's "a reword breaks trace matching, so re-collect." The
+    literal <code>used_prompt</code> text is stored alongside so the file is self-describing.</li>
+    <li><strong>YAML, not JSON</strong>, precisely because the file has two writers: the harness
+    owns the counts, you own the notes. Block scalars (<code>note: |</code>) make multiline
+    notes painless and <code>ruamel</code> round-trips them (and your comments) untouched.</li>
+    <li>Stale (orphaned) entries from a prior wording are left in place &mdash; delete them
+    by hand when you're done mining their notes.</li>
+  </ul>
+
+  <h2>Faithfulness caveat</h2>
+  <p>Like <code>suite.py</code>, this runs with <code>source_path</code> pointing at a non-existent dir and
+  <code>vuln_info=None</code>, so the <code>code_impact_analyzer</code> sub-agent reports "source not
+  available" and code-impact questions (<code>API_SIGNATURE_CHANGE</code>,
+  <code>REMOVES_FUNCTIONALITY</code>) under-fire. Numbers off this path are directional;
+  re-collect against real source + <code>vuln_info</code> before trusting a prune/re-tier
+  decision (same TODO as <code>suite.py</code> / <code>BreakingAgentParams</code>).</p>
+</body>
+</html>
